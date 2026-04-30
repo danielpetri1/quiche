@@ -11,7 +11,7 @@ members = [
   "tokio-quiche",
   "tokio-quiche/examples/http",
 ]
-exclude = ["fuzz", "tools/http3_test"]
+exclude = ["fuzz", "tools/http3_test", "tokio-quiche/nada"]
 resolver = "2"
 
 [workspace.package]

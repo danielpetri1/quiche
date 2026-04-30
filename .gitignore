@@ -2,3 +2,5 @@
 **/*.rs.bk
 **/Cargo.lock
 **/*.*qlog
+.DS_Store
+.idea/

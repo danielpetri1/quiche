@@ -251,7 +251,7 @@ async fn serve_file(
 
         send.send(OutboundFrame::Headers(vec![h3::Header::new(
             b":status", b"200",
-        )]))
+        )], None))
         .await?;
 
         send.send(OutboundFrame::body(
@@ -274,7 +274,7 @@ async fn send_error_response(
         .send(OutboundFrame::Headers(vec![
             h3::Header::new(b":status", status.as_bytes()),
             h3::Header::new(b"content-type", b"text/plain; charset=utf-8"),
-        ]))
+        ], None))
         .await
     {
         error!("Failed to send error headers: {e}");

@@ -253,8 +253,7 @@ impl RecoveryEpoch {
 
                     self.in_flight_count -= 1;
 
-                    if network_path_ids.contains(&(unacked.network_path_id, rtt))
-                    {
+                    if network_path_ids.contains(&(unacked.network_path_id, rtt)) {
                         network_path_ids.push((unacked.network_path_id, rtt));
                     }
 

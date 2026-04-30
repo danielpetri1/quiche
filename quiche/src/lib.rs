@@ -1509,6 +1509,8 @@ pub struct Connection {
     // Number of bytes buffered in the send buffer.
     tx_buffered: usize,
 
+    scheduled_stream: Option<u64>,
+
     /// Total number of bytes sent to the peer.
     tx_data: u64,
 
@@ -2023,6 +2025,8 @@ impl Connection {
             tx_cap: 0,
 
             tx_buffered: 0,
+
+            scheduled_stream: None,
 
             tx_data: 0,
             max_tx_data: 0,
@@ -3391,6 +3395,7 @@ impl Connection {
                 self.paths.get(recv_pid)?.network_path_id();
 
             if self.is_server &&
+                !self.paths.multipath() &&
                 recv_npid != previous_network_path_id &&
                 pkt_num_space.largest_rx_non_probing_pkt_num == pn
             {
@@ -4896,10 +4901,8 @@ impl Connection {
                                     ack_eliciting = true;
                                     in_flight = true;
                                     dgram_emitted = true;
-                                    let _ =
-                                        self.dgram_sent_count.saturating_add(1);
-                                    let _ =
-                                        path.dgram_sent_count.saturating_add(1);
+                                    self.dgram_sent_count += 1;
+                                    path.dgram_sent_count += 1;
                                 }
                             },
 
@@ -4923,8 +4926,27 @@ impl Connection {
             !dgram_emitted &&
             (consider_backup_paths || !path.is_backup()) &&
             (!path.potentially_lost() || !has_other_active)
-        {
-            while let Some(priority_key) = self.streams.peek_flushable() {
+        {// If the scheduler selected a specific stream, try it first.
+            let mut scheduled = self.scheduled_stream.take();
+
+            if let Some(_sid) = scheduled {
+                qlog_with_type!(QLOG_PACKET_TX, self.qlog, q, {
+                    let ev_data = EventData::Marker {
+                        marker_type: "eps-aware-ecf".to_string(),
+                        message: Some(format!(
+                            "eps-aware sid={} (send_pid={:?}, send_npid={:?})",
+                            _sid, send_pid, send_npid
+                        )),
+                    };
+                    q.add_event_data_with_instant(ev_data, now).ok();
+                });
+            }
+
+            while let Some(priority_key) = scheduled
+                .take()
+                .and_then(|sid| self.streams.get_flushable_key(sid))
+                .or_else(|| self.streams.peek_flushable())
+            {
                 let stream_id = priority_key.id;
                 let stream = match self.streams.get_mut(stream_id) {
                     // Avoid sending frames for streams that were already stopped.
@@ -5944,6 +5966,22 @@ impl Connection {
         stream.recv.is_fin()
     }
 
+    /// Returns the stream ID, urgency, and incremental flag of the
+    /// highest-priority stream that is ready to send data, without consuming
+    /// it from the queue.
+    ///
+    /// Returns `None` if no stream is currently flushable.
+    pub fn peek_next_flushable_stream(&self) -> Option<(u64, u8, bool)> {
+        self.streams
+            .peek_flushable()
+            .map(|k| (k.id, k.urgency, k.incremental))
+    }
+
+    /// Returns all priority keys of flushable streams in EPS priority order.
+    pub fn flushable_keys(&self) -> SmallVec<[Arc<StreamPriorityKey>; 16]> {
+        self.streams.flushable_keys()
+    }
+
     /// Returns the number of bidirectional streams that can be created
     /// before the peer's stream count limit is reached.
     ///
@@ -6236,6 +6274,27 @@ impl Connection {
     #[inline]
     pub fn dgram_send_queue_byte_size(&self) -> usize {
         self.dgram_send_queue.byte_size()
+    }
+
+    /// Returns the number of bytes in connection-level send buffers.
+    #[inline]
+    pub fn send_buffer_size(&self) -> usize {
+        self.tx_buffered + self.dgram_send_queue.byte_size()
+    }
+
+    /// Returns the bytes buffered (but not yet emitted) for a single stream.
+    pub fn stream_send_buffer_size(&self, stream_id: u64) -> usize {
+        self.streams.stream_send_buffer_size(stream_id)
+    }
+
+    /// Sets a stream hint for the next send() / send_on_path() call.
+    ///
+    /// When set, the send path will prefer this stream over the default
+    /// priority-based selection. The hint is consumed (reset to `None`)
+    /// after each send call.
+    #[inline]
+    pub fn set_scheduled_stream(&mut self, stream_id: Option<u64>) {
+        self.scheduled_stream = stream_id;
     }
 
     /// Returns whether or not the DATAGRAM send queue is full.
@@ -8474,12 +8533,10 @@ impl Connection {
 
                 self.dgram_recv_queue.push(data)?;
 
-                let _ = self.dgram_recv_count.saturating_add(1);
-                let _ = self
-                    .paths
-                    .get_mut(recv_path_id)?
-                    .dgram_recv_count
-                    .saturating_add(1);
+                self.dgram_recv_count += 1;
+                if let Ok(path) = self.paths.get_mut(recv_path_id) {
+                    path.dgram_recv_count += 1;
+                }
             },
 
             frame::Frame::DatagramHeader { .. } => unreachable!(),

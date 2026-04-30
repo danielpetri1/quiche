@@ -55,7 +55,7 @@ async fn test_additional_headers() {
                         // Send initial headers.
                         send.send(OutboundFrame::Headers(vec![Header::new(
                             b":status", b"103",
-                        )]))
+                        )], None))
                         .await
                         .unwrap();
 
@@ -67,7 +67,7 @@ async fn test_additional_headers() {
                         // Send additional headers.
                         send.send(OutboundFrame::Headers(vec![Header::new(
                             b":status", b"200",
-                        )]))
+                        )], None))
                         .await
                         .unwrap();
                     },

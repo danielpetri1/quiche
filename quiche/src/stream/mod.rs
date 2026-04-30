@@ -403,6 +403,30 @@ impl StreamMap {
         self.flushable.front().clone_pointer()
     }
 
+    /// Returns the priority key for a specific stream if it is flushable.
+    pub fn get_flushable_key(
+        &self,
+        stream_id: u64,
+    ) -> Option<Arc<StreamPriorityKey>> {
+        let stream = self.streams.get(&stream_id)?;
+        if stream.priority_key.flushable.is_linked() {
+            Some(Arc::clone(&stream.priority_key))
+        } else {
+            None
+        }
+    }
+
+    /// Returns all flushable stream priority keys in EPS priority order.
+    pub fn flushable_keys(&self) -> SmallVec<[Arc<StreamPriorityKey>; 16]> {
+        let mut result = SmallVec::new();
+        let mut cursor = self.flushable.front();
+        while let Some(key) = cursor.clone_pointer() {
+            result.push(key);
+            cursor.move_next();
+        }
+        result
+    }
+
     /// Updates the priorities of a stream.
     pub fn update_priority(
         &mut self, old: &Arc<StreamPriorityKey>, new: &Arc<StreamPriorityKey>,
@@ -597,6 +621,16 @@ impl StreamMap {
         !self.flushable.is_empty()
     }
 
+    /// Returns the bytes buffered (but not yet emitted) for a single stream.
+    pub fn stream_send_buffer_size(&self, stream_id: u64) -> usize {
+        self.streams
+            .get(&stream_id)
+            .map(|s| {
+                s.send.off_back().saturating_sub(s.send.off_front()) as usize
+            })
+            .unwrap_or(0)
+    }
+
     /// Returns true if there are any streams that have data to read.
     pub fn has_readable(&self) -> bool {
         !self.readable.is_empty()
@@ -754,15 +788,37 @@ pub fn is_bidi(stream_id: u64) -> bool {
     (stream_id & 0x2) == 0
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct StreamPriorityKey {
     pub urgency: u8,
     pub incremental: bool,
     pub id: u64,
 
+    /// Per-stream waiting flag for the SA-ECF scheduler.
+    /// When `true`, the scheduler prefers to wait for a faster path
+    /// rather than sending this stream on a slower available path.
+    pub waiting: std::sync::atomic::AtomicBool,
+
     pub readable: RBTreeAtomicLink,
     pub writable: RBTreeAtomicLink,
     pub flushable: RBTreeAtomicLink,
+}
+
+
+impl Clone for StreamPriorityKey {
+    fn clone(&self) -> Self {
+        Self {
+            urgency: self.urgency,
+            incremental: self.incremental,
+            id: self.id,
+            waiting: std::sync::atomic::AtomicBool::new(
+                self.waiting.load(std::sync::atomic::Ordering::Relaxed),
+            ),
+            readable: Default::default(),
+            writable: Default::default(),
+            flushable: Default::default(),
+        }
+    }
 }
 
 impl Default for StreamPriorityKey {
@@ -771,6 +827,7 @@ impl Default for StreamPriorityKey {
             urgency: DEFAULT_URGENCY,
             incremental: true,
             id: Default::default(),
+            waiting: Default::default(),
             readable: Default::default(),
             writable: Default::default(),
             flushable: Default::default(),

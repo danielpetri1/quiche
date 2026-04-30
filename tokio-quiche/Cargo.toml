@@ -73,6 +73,7 @@ tokio-util = { workspace = true, features = [
 ] }
 triomphe = { workspace = true }
 url = { workspace = true }
+atomic_float = "1.1.0"
 
 [dev-dependencies]
 h3i = { workspace = true }

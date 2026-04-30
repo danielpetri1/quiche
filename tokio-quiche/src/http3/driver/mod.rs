@@ -95,7 +95,7 @@ pub use self::server::ServerH3Event;
 
 // The priority of all HTTP/3 responses is currently fixed at this value.
 // TODO: make this configurable as part of `OutboundFrame::Headers`
-const DEFAULT_PRIO: h3::Priority = h3::Priority::new(3, true);
+const DEFAULT_PRIO: h3::Priority = h3::Priority::new(3, false);
 
 // For a stream use a channel with 16 entries, which works out to 16 * 64KB =
 // 1MB of max buffered data.
@@ -267,8 +267,9 @@ impl H3Event {
 /// UDP datagrams.
 #[derive(Debug)]
 pub enum OutboundFrame {
-    /// Response headers to be sent to the peer.
-    Headers(Vec<h3::Header>),
+    /// Response headers to be sent to the peer, with an optional H3 priority.
+    /// Falls back to the default priority when `None`.
+    Headers(Vec<h3::Header>, Option<h3::Priority>),
     /// Response body/CONNECT downstream data plus FIN flag.
     #[cfg(feature = "zero-copy")]
     Body(crate::buf_factory::QuicheBuf, bool),
@@ -638,16 +639,16 @@ impl<H: DriverHooks> H3Driver<H> {
         match frame {
             // Initial headers were already sent, send additional headers now.
             #[cfg(not(feature = "gcongestion"))]
-            OutboundFrame::Headers(headers) if ctx.initial_headers_sent => conn
+            OutboundFrame::Headers(headers, _) if ctx.initial_headers_sent => conn
                 .send_additional_headers(qconn, stream_id, headers, false, false),
 
             // Send initial headers.
-            OutboundFrame::Headers(headers) => conn
+            OutboundFrame::Headers(headers, priority) => conn
                 .send_response_with_priority(
                     qconn,
                     stream_id,
                     headers,
-                    &DEFAULT_PRIO,
+                    priority.as_ref().unwrap_or(&DEFAULT_PRIO),
                     false,
                 )
                 .inspect(|_| ctx.initial_headers_sent = true),

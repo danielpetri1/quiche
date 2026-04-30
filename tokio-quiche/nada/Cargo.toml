@@ -1,0 +1,29 @@
+[workspace]
+
+[package]
+name = "masque"
+version = "0.1.0"
+authors = ["Daniel Petri <petriroc@net.in.tum.de>"]
+edition = "2021"
+
+[[bin]]
+name = "masque-client"
+path = "src/bin/masque-client.rs"
+
+[[bin]]
+name = "masque-proxy"
+path = "src/bin/masque-proxy.rs"
+
+[dependencies]
+clap = { version = "4.4", features = ["derive"] }
+futures = "0.3"
+log = { version = "0.4.20" }
+tokio-quiche = { path = "..", features = ["capture_keylogs"] }
+tokio = { version = "1", features = ["rt-multi-thread"] }
+quiche = { path = "../../quiche", features = ["qlog"] }
+sfv = "0.14.0"
+foundations = { version = "4", default-features = false, features = [
+  "logging"
+] }
+octets = { path = "../../octets" }
+serde_json = "1.0"

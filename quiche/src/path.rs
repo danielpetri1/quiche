@@ -814,6 +814,7 @@ impl Path {
             rttvar: network_path.rttvar(),
             rtt_update: network_path.rtt_update_count(),
             cwnd: self.recovery.cwnd(),
+            cwnd_available: self.recovery.cwnd_available(),
             sent_bytes: self.sent_bytes,
             recv_bytes: self.recv_bytes,
             lost_bytes: self.recovery.bytes_lost,
@@ -1840,6 +1841,9 @@ pub struct PathStats {
 
     /// The size of the connection's congestion window in bytes.
     pub cwnd: usize,
+
+    /// The number of bytes available in the congestion window.
+    pub cwnd_available: usize,
 
     /// The number of sent bytes.
     pub sent_bytes: u64,

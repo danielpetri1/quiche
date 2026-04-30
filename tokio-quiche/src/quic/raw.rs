@@ -125,6 +125,16 @@ where
         with_pktinfo: false,
     };
 
+    // Build a per-connection scheduler-update channel when a packet scheduler
+    // is provided, so callers can swap the scheduler at runtime.
+    let (scheduler_update_tx, scheduler_update_rx) = if packet_scheduler.is_some()
+    {
+        let (tx, rx) = mpsc::unbounded_channel();
+        (Some(tx), Some(rx))
+    } else {
+        (None, None)
+    };
+
     let conn_params = QuicConnectionParams {
         writer_cfg,
         initial_pkt: None,
@@ -140,9 +150,10 @@ where
         local_addrs,
         peer_addr,
         packet_scheduler,
+        scheduler_update_rx,
     };
 
-    let conn = InitialQuicConnection::new(conn_params);
+    let conn = InitialQuicConnection::new(conn_params, scheduler_update_tx);
     let incoming_tx = conn.incoming_ev_sender.clone();
 
     ConnWrapperResult {

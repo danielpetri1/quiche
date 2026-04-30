@@ -177,6 +177,7 @@ where
     stats: QuicConnectionStatsShared,
     pub(crate) incoming_ev_sender: mpsc::Sender<Incoming>,
     incoming_ev_receiver: mpsc::Receiver<Incoming>,
+    scheduler_update_tx: Option<mpsc::UnboundedSender<BoxedScheduler>>,
 }
 
 impl<Tx, M> InitialQuicConnection<Tx, M>
@@ -185,7 +186,7 @@ where
     M: Metrics,
 {
     #[inline]
-    pub(crate) fn new(params: QuicConnectionParams<Tx, M>) -> Self {
+    pub(crate) fn new(params: QuicConnectionParams<Tx, M>, scheduler_update_tx: Option<mpsc::UnboundedSender<BoxedScheduler>>,) -> Self {
         let (incoming_ev_sender, incoming_ev_receiver) =
             mpsc::channel(INCOMING_QUEUE_SIZE);
         let audit_log_stats = Arc::new(QuicAuditStats::new(params.scid.to_vec()));
@@ -201,7 +202,14 @@ where
             stats,
             incoming_ev_sender,
             incoming_ev_receiver,
+            scheduler_update_tx,
         }
+    }
+
+    pub fn take_scheduler_updater(
+        &mut self,
+    ) -> Option<mpsc::UnboundedSender<BoxedScheduler>> {
+        self.scheduler_update_tx.take()
     }
 
     /// The local addresses this connection listens on.
@@ -288,6 +296,7 @@ where
             init_rx_time: self.params.init_rx_time,
             metrics: self.params.metrics.clone(),
             packet_scheduler: self.params.packet_scheduler,
+            scheduler_update_rx: self.params.scheduler_update_rx,
         };
 
         let handshake_fut = async move {
@@ -429,6 +438,7 @@ where
     pub local_addrs: Vec<SocketAddr>,
     pub peer_addr: SocketAddr,
     pub packet_scheduler: Option<BoxedScheduler>,
+    pub scheduler_update_rx: Option<mpsc::UnboundedReceiver<BoxedScheduler>>,
 }
 
 /// Metadata about an established QUIC connection.

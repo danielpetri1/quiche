@@ -36,19 +36,24 @@ use std::sync::Arc;
 use crate::quic::QuicheConnection;
 
 pub type BoxedScheduler = Arc<dyn PacketScheduler + Send + Sync + 'static>;
-
+const ECF_BETA: f64 = 10.0;
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 #[repr(C)]
 pub enum PacketSchedulingAlgorithm {
-    /// MinRTT Path Scheduler algorithm - selects path with lowest RTT
-    MinRTT        = 0,
+    /// LowRTT Path Scheduler algorithm - selects path with lowest RTT
+    MinRTT = 0,
     /// Round Robin Path Scheduler algorithm - cycles through available paths
-    RoundRobin    = 1,
+    RoundRobin = 1,
     /// Random Path Scheduler algorithm - randomly selects among available paths
-    Random        = 2,
-    /// Lowest Latency Path Scheduler algorithm - like MinRTT but also considers
-    /// jitter
+    Random = 2,
+    /// Lowest Latency Path Scheduler algorithm - like MinRTT but considers jitter
     LowestLatency = 3,
+    /// LowRTT - like MinRTT but only considers paths with available cwnd
+    LowRTT = 4,
+    /// ECF: may wait for a faster path to become available
+    EarliestCompletionFirst = 5,
+    /// Stream-Aware Earliest Completion First accounting for HTTP/3 hints.
+    StreamAwareEarliestCompletionFirst = 6,
 }
 
 impl PacketSchedulingAlgorithm {
@@ -59,6 +64,13 @@ impl PacketSchedulingAlgorithm {
             PacketSchedulingAlgorithm::RoundRobin => "roundrobin",
             PacketSchedulingAlgorithm::Random => "random",
             PacketSchedulingAlgorithm::LowestLatency => "lowestlatency",
+            PacketSchedulingAlgorithm::EarliestCompletionFirst => {
+                "earliestcompletionfirst"
+            }
+            PacketSchedulingAlgorithm::StreamAwareEarliestCompletionFirst => {
+                "sa-ecf"
+            }
+            PacketSchedulingAlgorithm::LowRTT => "lowrtt",
         }
     }
 
@@ -80,10 +92,45 @@ impl FromStr for PacketSchedulingAlgorithm {
     fn from_str(name: &str) -> Result<Self, quiche::Error> {
         match name {
             "minrtt" => Ok(PacketSchedulingAlgorithm::MinRTT),
-            "roundrobin" => Ok(PacketSchedulingAlgorithm::RoundRobin),
-            "random" => Ok(PacketSchedulingAlgorithm::Random),
-            "lowestlatency" => Ok(PacketSchedulingAlgorithm::LowestLatency),
+            "lowrtt" => Ok(PacketSchedulingAlgorithm::LowRTT),
+            "roundrobin" | "rr" => Ok(PacketSchedulingAlgorithm::RoundRobin),
+            "random" | "rand" => Ok(PacketSchedulingAlgorithm::Random),
+            "lowestlatency" | "ll" => {
+                Ok(PacketSchedulingAlgorithm::LowestLatency)
+            }
+            "ecf" => Ok(PacketSchedulingAlgorithm::EarliestCompletionFirst),
+            "sa-ecf" | "eps-aware-ecf" | "stream-aware-ecf" => {
+                Ok(PacketSchedulingAlgorithm::StreamAwareEarliestCompletionFirst)
+            }
             _ => Err(quiche::Error::UnknownPacketScheduler),
+        }
+    }
+}
+
+/// The result of a scheduling decision.
+#[derive(Debug, Clone)]
+pub struct SchedulerDecision {
+    /// The path to send on.
+    pub path: (SocketAddr, SocketAddr),
+    /// Optional stream ID hint for quiche's send path.
+    /// When `Some`, quiche will prefer this stream.
+    pub stream_id: Option<u64>,
+}
+
+impl SchedulerDecision {
+    /// Path-only decision.
+    fn path_only(local: SocketAddr, peer: SocketAddr) -> Self {
+        Self {
+            path: (local, peer),
+            stream_id: None,
+        }
+    }
+
+    /// A stream-aware scheduling decision.
+    fn stream_aware(local: SocketAddr, peer: SocketAddr, stream_id: u64) -> Self {
+        Self {
+            path: (local, peer),
+            stream_id: Some(stream_id),
         }
     }
 }
@@ -92,9 +139,7 @@ impl FromStr for PacketSchedulingAlgorithm {
 /// sending packets
 pub trait PacketScheduler: Debug + Send + Sync + 'static {
     /// Get the next path to send a packet on
-    fn next_path(
-        &self, conn: &QuicheConnection,
-    ) -> Option<(SocketAddr, SocketAddr)>;
+    fn next_path(&self, conn: &QuicheConnection) -> Option<SchedulerDecision>;
 
     /// Returns the name of the scheduler.
     fn name(&self) -> &'static str;
@@ -111,11 +156,20 @@ impl PacketSchedulerFactory {
     pub fn create(algorithm: PacketSchedulingAlgorithm) -> BoxedScheduler {
         match algorithm {
             PacketSchedulingAlgorithm::MinRTT => Arc::new(MinRTTScheduler::new()),
-            PacketSchedulingAlgorithm::RoundRobin =>
-                Arc::new(RoundRobinScheduler::new()),
+            PacketSchedulingAlgorithm::LowRTT => Arc::new(LowRTTScheduler::new()),
+            PacketSchedulingAlgorithm::RoundRobin => {
+                Arc::new(RoundRobinScheduler::new())
+            }
             PacketSchedulingAlgorithm::Random => Arc::new(RandomScheduler::new()),
-            PacketSchedulingAlgorithm::LowestLatency =>
-                Arc::new(LowestLatencyScheduler::new()),
+            PacketSchedulingAlgorithm::LowestLatency => {
+                Arc::new(LowestLatencyScheduler::new())
+            }
+            PacketSchedulingAlgorithm::EarliestCompletionFirst => {
+                Arc::new(EarliestCompletionFirstScheduler::new())
+            }
+            PacketSchedulingAlgorithm::StreamAwareEarliestCompletionFirst => {
+                Arc::new(StreamAwareEarliestCompletionFirst::new())
+            }
         }
     }
 
@@ -143,13 +197,14 @@ impl Default for MinRTTScheduler {
 }
 
 impl PacketScheduler for MinRTTScheduler {
-    fn next_path(
-        &self, conn: &QuicheConnection,
-    ) -> Option<(SocketAddr, SocketAddr)> {
+    fn next_path(&self, conn: &QuicheConnection) -> Option<SchedulerDecision> {
         if let Some((path_id, _)) = conn.get_next_send_path_id(None, None, None) {
             let path = conn.path_stats().find(|p| p.path_id == path_id);
             if let Some(path) = path {
-                return Some((path.local_addr, path.peer_addr));
+                return Some(SchedulerDecision::path_only(
+                    path.local_addr,
+                    path.peer_addr,
+                ));
             }
         }
 
@@ -161,10 +216,11 @@ impl PacketScheduler for MinRTTScheduler {
 
         // Sort paths by RTT (lowest first)
         paths.sort_by(|a, b| a.rtt.cmp(&b.rtt));
-        // eprintln!("Sorted paths: {:?}", paths);
 
         // Return the path with the lowest RTT
-        paths.first().map(|p| (p.local_addr, p.peer_addr))
+        paths
+            .first()
+            .map(|p| SchedulerDecision::path_only(p.local_addr, p.peer_addr))
     }
 
     fn name(&self) -> &'static str {
@@ -173,6 +229,65 @@ impl PacketScheduler for MinRTTScheduler {
 
     fn algorithm(&self) -> PacketSchedulingAlgorithm {
         PacketSchedulingAlgorithm::MinRTT
+    }
+}
+
+/// LowRTT Path Scheduler algorithm.
+///
+/// Like MinRTT but only considers paths with available congestion window,
+/// selecting the one with the lowest smoothed RTT among those.
+#[derive(Debug, Clone)]
+pub struct LowRTTScheduler;
+
+impl LowRTTScheduler {
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+impl Default for LowRTTScheduler {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl PacketScheduler for LowRTTScheduler {
+    fn next_path(&self, conn: &QuicheConnection) -> Option<SchedulerDecision> {
+        if let Some((path_id, _)) = conn.get_next_send_path_id(None, None, None) {
+            let path = conn.path_stats().find(|p| p.path_id == path_id);
+            if let Some(path) = path {
+                return Some(SchedulerDecision::path_only(
+                    path.local_addr,
+                    path.peer_addr,
+                ));
+            }
+        }
+
+        let mut paths: Vec<_> = self
+            .algorithm()
+            .active_paths(conn)
+            .into_iter()
+            .filter(|p| p.cwnd_available > 0)
+            .collect();
+
+        if paths.is_empty() {
+            return None;
+        }
+
+        // Sort by smoothed RTT (lowest first)
+        paths.sort_by(|a, b| a.rtt.cmp(&b.rtt));
+
+        paths
+            .first()
+            .map(|p| SchedulerDecision::path_only(p.local_addr, p.peer_addr))
+    }
+
+    fn name(&self) -> &'static str {
+        self.algorithm().name()
+    }
+
+    fn algorithm(&self) -> PacketSchedulingAlgorithm {
+        PacketSchedulingAlgorithm::LowRTT
     }
 }
 
@@ -197,18 +312,24 @@ impl Default for RoundRobinScheduler {
 }
 
 impl PacketScheduler for RoundRobinScheduler {
-    fn next_path(
-        &self, conn: &QuicheConnection,
-    ) -> Option<(SocketAddr, SocketAddr)> {
+    fn next_path(&self, conn: &QuicheConnection) -> Option<SchedulerDecision> {
         if let Some((path_id, _)) = conn.get_next_send_path_id(None, None, None) {
             let path = conn.path_stats().find(|p| p.path_id == path_id);
             if let Some(path) = path {
-                return Some((path.local_addr, path.peer_addr));
+                return Some(SchedulerDecision::path_only(
+                    path.local_addr,
+                    path.peer_addr,
+                ));
             }
         }
 
         let idx = self.current_index.fetch_add(1, Relaxed);
-        let paths = self.algorithm().active_paths(conn);
+        let paths: Vec<_> = self
+            .algorithm()
+            .active_paths(conn)
+            .into_iter()
+            .filter(|p| p.cwnd_available > 0)
+            .collect();
 
         if paths.is_empty() {
             return None;
@@ -220,7 +341,10 @@ impl PacketScheduler for RoundRobinScheduler {
         // Update the index for the next call
         self.current_index.store((idx + 1) % paths.len(), Relaxed);
 
-        Some((path.local_addr, path.peer_addr))
+        Some(SchedulerDecision::path_only(
+            path.local_addr,
+            path.peer_addr,
+        ))
     }
 
     fn name(&self) -> &'static str {
@@ -249,13 +373,14 @@ impl Default for RandomScheduler {
 }
 
 impl PacketScheduler for RandomScheduler {
-    fn next_path(
-        &self, conn: &QuicheConnection,
-    ) -> Option<(SocketAddr, SocketAddr)> {
+    fn next_path(&self, conn: &QuicheConnection) -> Option<SchedulerDecision> {
         if let Some((path_id, _)) = conn.get_next_send_path_id(None, None, None) {
             let path = conn.path_stats().find(|p| p.path_id == path_id);
             if let Some(path) = path {
-                return Some((path.local_addr, path.peer_addr));
+                return Some(SchedulerDecision::path_only(
+                    path.local_addr,
+                    path.peer_addr,
+                ));
             }
         }
 
@@ -267,7 +392,9 @@ impl PacketScheduler for RandomScheduler {
 
         // Randomly select an active path
         let mut rng = thread_rng();
-        paths.choose(&mut rng).map(|p| (p.local_addr, p.peer_addr))
+        paths
+            .choose(&mut rng)
+            .map(|p| SchedulerDecision::path_only(p.local_addr, p.peer_addr))
     }
 
     fn name(&self) -> &'static str {
@@ -296,9 +423,7 @@ impl Default for LowestLatencyScheduler {
 }
 
 impl PacketScheduler for LowestLatencyScheduler {
-    fn next_path(
-        &self, conn: &QuicheConnection,
-    ) -> Option<(SocketAddr, SocketAddr)> {
+    fn next_path(&self, conn: &QuicheConnection) -> Option<SchedulerDecision> {
         let mut paths = self.algorithm().active_paths(conn);
 
         if paths.is_empty() {
@@ -315,7 +440,9 @@ impl PacketScheduler for LowestLatencyScheduler {
         });
 
         // Return the path with the lowest latency score
-        paths.first().map(|p| (p.local_addr, p.peer_addr))
+        paths
+            .first()
+            .map(|p| SchedulerDecision::path_only(p.local_addr, p.peer_addr))
     }
 
     fn name(&self) -> &'static str {
@@ -324,6 +451,263 @@ impl PacketScheduler for LowestLatencyScheduler {
 
     fn algorithm(&self) -> PacketSchedulingAlgorithm {
         PacketSchedulingAlgorithm::LowestLatency
+    }
+}
+
+/// Earliest Completion First Path Scheduler algorithm.
+#[derive(Debug)]
+pub struct EarliestCompletionFirstScheduler {
+    waiting: atomic_float::AtomicF64,
+
+    /// ECF hysteresis value
+    beta: atomic_float::AtomicF64,
+}
+
+impl EarliestCompletionFirstScheduler {
+    pub fn new() -> Self {
+        Self {
+            waiting: 0.0.into(),
+            beta: ECF_BETA.into(),
+        }
+    }
+}
+
+impl Default for EarliestCompletionFirstScheduler {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Based on:
+/// Yeon-sup Lim, Erich M. Nahum, Don Towsley, and Richard J. Gibbens. 2017.
+/// ECF: An MPTCP Path Scheduler to Manage Heterogeneous Paths.
+/// In Proceedings of CoNEXT ’17. ACM, New York, NY, USA, 13 pages.
+/// https: //doi.org/10.1145/3143361.3143376
+impl PacketScheduler for EarliestCompletionFirstScheduler {
+    fn next_path(&self, conn: &QuicheConnection) -> Option<SchedulerDecision> {
+        if let Some((path_id, _)) = conn.get_next_send_path_id(None, None, None) {
+            let path = conn.path_stats().find(|p| p.path_id == path_id);
+            if let Some(path) = path {
+                return Some(SchedulerDecision::path_only(
+                    path.local_addr,
+                    path.peer_addr,
+                ));
+            }
+        }
+
+        // Algorithm 1 - ECF Scheduler
+        // Find fastest subflow x_f with smallest RTT
+        let mut paths = self.algorithm().active_paths(conn);
+
+        if paths.is_empty() {
+            return None;
+        }
+
+        // Sort paths by RTT (lowest first)
+        paths.sort_by(|a, b| a.rtt.cmp(&b.rtt));
+
+        // Get the fastest path
+        let x_f_stats = paths.first()?;
+        let x_f_available: bool = x_f_stats.cwnd_available > 0;
+
+        // if x_f is available for packet transfer, use it
+        if x_f_available {
+            return Some(SchedulerDecision::path_only(
+                x_f_stats.local_addr,
+                x_f_stats.peer_addr,
+            ));
+        }
+
+        let x_f_cwnd = x_f_stats.cwnd as f64;
+        let x_f_rtt = x_f_stats.rtt;
+        let x_f_rttvar = x_f_stats.rttvar;
+
+        // Fastest available path
+        let x_s_stats = paths.iter().find(|p| p.cwnd_available > 0)?;
+
+        let x_s_cwnd = x_s_stats.cwnd as f64;
+        let x_s_rtt = x_s_stats.rtt;
+        let x_s_rttvar = x_s_stats.rttvar;
+
+        // Size of the connection-level send buffer
+        let k = conn.send_buffer_size() as f64;
+
+        let n = 1.0 + k / x_f_cwnd;
+        let delta = x_f_rttvar.max(x_s_rttvar);
+
+        let waiting = self.waiting.load(Relaxed);
+        let beta = self.beta.load(Relaxed);
+        let x_f_rtt_s = x_f_rtt.as_secs_f64();
+        let x_s_rtt_s = x_s_rtt.as_secs_f64();
+        let delta_s = delta.as_secs_f64();
+
+        if n * x_f_rtt_s < (1.0 + waiting * beta) * (x_s_rtt_s + delta_s) {
+            if (k * x_s_rtt_s) / x_s_cwnd >= 2.0 * x_f_rtt_s + delta_s {
+                self.waiting.store(1.0, Relaxed); // Wait for x_f
+                None // No available path
+            } else {
+                Some(SchedulerDecision::path_only(
+                    x_s_stats.local_addr,
+                    x_s_stats.peer_addr,
+                ))
+            }
+        } else {
+            self.waiting.store(0.0, Relaxed);
+            Some(SchedulerDecision::path_only(
+                x_s_stats.local_addr,
+                x_s_stats.peer_addr,
+            ))
+        }
+    }
+
+    fn name(&self) -> &'static str {
+        self.algorithm().name()
+    }
+
+    fn algorithm(&self) -> PacketSchedulingAlgorithm {
+        PacketSchedulingAlgorithm::EarliestCompletionFirst
+    }
+}
+
+/// Stream-Aware Earliest Completion First Path Scheduler algorithm.
+#[derive(Debug)]
+pub struct StreamAwareEarliestCompletionFirst {
+    /// ECF hysteresis value
+    beta: atomic_float::AtomicF64,
+
+    /// Multiplexing granularity (in bytes per sending opportunity) for incremental streams.
+    l: atomic_float::AtomicF64,
+}
+
+impl StreamAwareEarliestCompletionFirst {
+    pub fn new() -> Self {
+        Self {
+            beta: ECF_BETA.into(),
+            l: 1300.0.into(),
+        }
+    }
+}
+
+impl Default for StreamAwareEarliestCompletionFirst {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Based on:
+/// Alexander Rabitsch, Per Hurtig, and Anna Brunstrom. 2018.
+/// A Stream-Aware Multipath QUIC Scheduler for Heterogeneous Paths.
+/// In EPIQ ’18: Workshop on the Evolution, Performance, and Interoperability of QUIC, December 4, 2018, Heraklion, Greece.
+/// ACM, New York,  NY, USA, 7 pages. https://doi.org/10.1145/3284850.3284855
+impl PacketScheduler for StreamAwareEarliestCompletionFirst {
+    fn next_path(&self, conn: &QuicheConnection) -> Option<SchedulerDecision> {
+        if let Some((path_id, _)) = conn.get_next_send_path_id(None, None, None) {
+            let path = conn.path_stats().find(|p| p.path_id == path_id);
+            if let Some(path) = path {
+                return Some(SchedulerDecision::path_only(
+                    path.local_addr,
+                    path.peer_addr,
+                ));
+            }
+        }
+
+        // Algorithm 1 - SA-ECF Scheduler
+        // Sort paths by RTT
+        let mut paths = self.algorithm().active_paths(conn);
+        paths.sort_by(|a, b| a.rtt.cmp(&b.rtt));
+
+        if paths.is_empty() {
+            return None;
+        }
+
+        // Find the fastest path, p_f, with the lowest RTT
+        let p_f_stats = paths.first()?;
+
+        let flushable_keys = conn.flushable_keys();
+
+        // If p_f is available, use it with the highest-priority stream.
+        // Let EPS handle the stream choice separately later.
+        // Prevents excessive qlog markers for the non-waiting case.
+        if p_f_stats.cwnd_available > 0 {
+            return Some(SchedulerDecision::path_only(
+                p_f_stats.local_addr,
+                p_f_stats.peer_addr,
+            ));
+        }
+
+        // Find the fastest available path, p_s, with the lowest RTT
+        let p_s_stats = paths.iter().find(|p| p.cwnd_available > 0)?;
+
+        let p_f_rtt_s = p_f_stats.rtt.as_secs_f64();
+        let p_f_rttvar = p_f_stats.rttvar;
+        let p_f_cwnd = p_f_stats.cwnd as f64;
+
+        let p_s_rtt_s = p_s_stats.rtt.as_secs_f64();
+        let p_s_rttvar = p_s_stats.rttvar;
+        let p_s_cwnd = p_s_stats.cwnd as f64;
+
+        let delta_s = p_f_rttvar.max(p_s_rttvar).as_secs_f64();
+        let beta = self.beta.load(Relaxed);
+
+        for priority_key in &flushable_keys {
+            let waiting = if priority_key.waiting.load(Relaxed) {
+                1.0
+            } else {
+                0.0
+            };
+
+            // "Bytes until completion" k is the number of bytes sent at the
+            // connection level before the individual stream completes.
+            // Incremental streams at the same urgency level are sent out in a
+            // round-robin fashion. Non-incremental streams are not interleaved.
+            let l = self.l.load(Relaxed);
+            let bytes_left = conn.stream_send_buffer_size(priority_key.id) as f64;
+            let k = if !priority_key.incremental || l >= bytes_left {
+                bytes_left
+            } else {
+                let n = flushable_keys
+                    .iter()
+                    .filter(|f| {
+                        f.urgency == priority_key.urgency && f.incremental
+                    })
+                    .count()
+                    .max(1) as f64;
+
+                bytes_left * n - (n - 1.0) * l
+            };
+
+            let n = 1.0 + k / p_f_cwnd;
+
+            if n * p_f_rtt_s < (1.0 + waiting * beta) * (p_s_rtt_s + delta_s) {
+                if (k * p_s_rtt_s) / p_s_cwnd >= 2.0 * p_f_rtt_s + delta_s {
+                    priority_key.waiting.store(true, Relaxed);
+                    continue; // Stream waits for faster path
+                } else {
+                    return Some(SchedulerDecision::stream_aware(
+                        p_s_stats.local_addr,
+                        p_s_stats.peer_addr,
+                        priority_key.id,
+                    ));
+                }
+            } else {
+                priority_key.waiting.store(false, Relaxed);
+                return Some(SchedulerDecision::stream_aware(
+                    p_s_stats.local_addr,
+                    p_s_stats.peer_addr,
+                    priority_key.id,
+                ));
+            }
+        }
+
+        None // No transmission
+    }
+
+    fn name(&self) -> &'static str {
+        self.algorithm().name()
+    }
+
+    fn algorithm(&self) -> PacketSchedulingAlgorithm {
+        PacketSchedulingAlgorithm::StreamAwareEarliestCompletionFirst
     }
 }
 
@@ -337,6 +721,11 @@ mod tests {
             PacketSchedulerFactory::create(PacketSchedulingAlgorithm::MinRTT);
         assert_eq!(scheduler.algorithm(), PacketSchedulingAlgorithm::MinRTT);
         assert_eq!(scheduler.name(), "minrtt");
+
+        let scheduler =
+            PacketSchedulerFactory::create(PacketSchedulingAlgorithm::LowRTT);
+        assert_eq!(scheduler.algorithm(), PacketSchedulingAlgorithm::LowRTT);
+        assert_eq!(scheduler.name(), "lowrtt");
 
         let scheduler =
             PacketSchedulerFactory::create(PacketSchedulingAlgorithm::RoundRobin);
@@ -356,6 +745,24 @@ mod tests {
             PacketSchedulingAlgorithm::LowestLatency
         );
         assert_eq!(scheduler.name(), "lowestlatency");
+
+        let scheduler = PacketSchedulerFactory::create(
+            PacketSchedulingAlgorithm::EarliestCompletionFirst,
+        );
+        assert_eq!(
+            scheduler.algorithm(),
+            PacketSchedulingAlgorithm::EarliestCompletionFirst
+        );
+        assert_eq!(scheduler.name(), "earliestcompletionfirst");
+
+        let scheduler = PacketSchedulerFactory::create(
+            PacketSchedulingAlgorithm::StreamAwareEarliestCompletionFirst,
+        );
+        assert_eq!(
+            scheduler.algorithm(),
+            PacketSchedulingAlgorithm::StreamAwareEarliestCompletionFirst
+        );
+        assert_eq!(scheduler.name(), "sa-ecf");
     }
 
     #[test]

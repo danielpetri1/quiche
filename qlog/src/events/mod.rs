@@ -301,7 +301,8 @@ impl From<EventType> for EventImportance {
                 EventImportance::Base,
             EventType::QpackEventType(QpackEventType::InstructionParsed) =>
                 EventImportance::Base,
-
+            EventType::GenericEventType(GenericEventType::Marker) =>
+                EventImportance::Extra,
             _ => unimplemented!(),
         }
     }

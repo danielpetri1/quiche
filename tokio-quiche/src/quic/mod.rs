@@ -269,10 +269,11 @@ where
         log::info!("setting up qlogs"; "qlog_dir"=>qlog_dir);
         let id = format!("{:?}", &scid);
         if let Ok(writer) = make_qlog_writer(qlog_dir, &id) {
-            quiche_conn.set_qlog(
+            quiche_conn.set_qlog_with_level(
                 std::boxed::Box::new(writer),
                 "tokio-quiche qlog".to_string(),
                 format!("tokio-quiche qlog id={id}"),
+                quiche::QlogLevel::Extra,
             );
         }
     }

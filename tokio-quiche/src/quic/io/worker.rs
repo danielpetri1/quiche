@@ -131,6 +131,8 @@ pub(crate) struct IoWorkerParams<Tx, M> {
     pub(crate) init_rx_time: Option<SystemTime>,
     pub(crate) metrics: M,
     pub(crate) packet_scheduler: Option<BoxedScheduler>,
+    pub(crate) scheduler_update_rx:
+        Option<mpsc::UnboundedReceiver<BoxedScheduler>>,
 }
 
 pub(crate) struct IoWorker<Tx, M, S> {
@@ -152,6 +154,7 @@ pub(crate) struct IoWorker<Tx, M, S> {
     bw_estimator: BandwidthReporter,
     packet_scheduler: Option<BoxedScheduler>,
     known_cids: HashSet<ConnectionId<'static>>,
+    scheduler_update_rx: Option<mpsc::UnboundedReceiver<BoxedScheduler>>,
 }
 
 impl<Tx, M, S> IoWorker<Tx, M, S>
@@ -188,6 +191,7 @@ where
             conn_stage,
             bw_estimator,
             packet_scheduler: params.packet_scheduler,
+            scheduler_update_rx: params.scheduler_update_rx,
             known_cids: HashSet::new(),
         }
     }
@@ -203,6 +207,20 @@ where
 
         loop {
             let now = Instant::now();
+
+            if let Some(ref mut rx) = self.scheduler_update_rx {
+                let mut latest = None;
+                while let Ok(sched) = rx.try_recv() {
+                    latest = Some(sched);
+                }
+                if let Some(sched) = latest {
+                    log::info!(
+                        "Applying runtime packet scheduler update";
+                        "scheduler" => sched.name()
+                    );
+                    self.packet_scheduler = Some(sched);
+                }
+            }
 
             self.write_state.has_pending_data = true;
 
@@ -482,8 +500,9 @@ where
 
         if qconn.is_multipath_enabled() {
             if let Some(scheduler) = &mut self.packet_scheduler {
-                if let Some((local_addr, peer_addr)) = scheduler.next_path(qconn)
-                {
+                if let Some(decision) = scheduler.next_path(qconn) {
+                    let (local_addr, peer_addr) = decision.path;
+                    qconn.set_scheduled_stream(decision.stream_id);
                     match qconn.send_on_path(
                         send_buf,
                         None,
@@ -506,19 +525,19 @@ where
                                         self.get_socket_id_for_address(from);
 
                                     return Ok(packet_size);
-                                },
+                                }
                                 _ => {
                                     return Err(Box::new(
                                         QuicheError::InvalidState,
                                     ));
-                                },
+                                }
                             }
-                        },
+                        }
                         Err(QuicheError::Done) => {
                             // Flush to network and yield when there are no
                             // more packets to write.
                             return Ok(0);
-                        },
+                        }
                         Err(e) => {
                             let error_code = if let Some(local_error) =
                                 qconn.local_error()
@@ -539,8 +558,11 @@ where
                                 );
 
                             return Err(Box::new(e));
-                        },
+                        }
                     }
+                } else {
+                    // A scheduling decision of "None" implies no transmission.
+                    return Ok(0);
                 }
             }
         }
@@ -1067,6 +1089,7 @@ impl<Tx, M, S> From<IoWorker<Tx, M, S>> for IoWorkerParams<Tx, M> {
             init_rx_time: value.init_rx_time,
             metrics: value.metrics,
             packet_scheduler: value.packet_scheduler,
+            scheduler_update_rx: value.scheduler_update_rx,
         }
     }
 }

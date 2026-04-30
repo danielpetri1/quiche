@@ -319,22 +319,34 @@ where
             self.config.handshake_timeout,
         );
 
-        let conn = InitialQuicConnection::new(QuicConnectionParams {
-            writer_cfg,
-            initial_pkt,
-            shutdown_tx: shutdown_tx.clone(),
-            conn_map_cmd_tx: self.conn_map_cmd_tx.clone(),
-            scid: scid.clone(),
-            metrics: self.metrics.clone(),
-            #[cfg(feature = "perf-quic-listener-metrics")]
-            init_rx_time,
-            handshake_info,
-            quiche_conn: conn,
-            sockets: vec![Arc::clone(&self.socket_tx)],
-            local_addrs: vec![local_addr],
-            peer_addr,
-            packet_scheduler: self.config.packet_scheduler.clone(),
-        });
+        let (scheduler_update_tx, scheduler_update_rx) =
+            if self.config.packet_scheduler.is_some() {
+                let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+                (Some(tx), Some(rx))
+            } else {
+                (None, None)
+            };
+
+        let conn = InitialQuicConnection::new(
+            QuicConnectionParams {
+                writer_cfg,
+                initial_pkt,
+                shutdown_tx: shutdown_tx.clone(),
+                conn_map_cmd_tx: self.conn_map_cmd_tx.clone(),
+                scid: scid.clone(),
+                metrics: self.metrics.clone(),
+                #[cfg(feature = "perf-quic-listener-metrics")]
+                init_rx_time,
+                handshake_info,
+                quiche_conn: conn,
+                sockets: vec![Arc::clone(&self.socket_tx)],
+                local_addrs: vec![local_addr],
+                peer_addr,
+                packet_scheduler: self.config.packet_scheduler.clone(),
+                scheduler_update_rx,
+            },
+            scheduler_update_tx,
+        );
 
         conn.audit_log_stats
             .set_transport_handshake_start(instant_to_system(

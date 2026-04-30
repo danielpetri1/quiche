@@ -285,6 +285,14 @@ where
             self.config.handshake_timeout,
         );
 
+        let (scheduler_update_tx, scheduler_update_rx) =
+            if self.config.packet_scheduler.is_some() {
+                let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+                (Some(tx), Some(rx))
+            } else {
+                (None, None)
+            };
+
         // Create a new InitialQuicConnection with multipath support
         // We need to create a new struct to hold multipath information
         let conn = InitialQuicConnection::new(
@@ -307,7 +315,9 @@ where
                     .collect(),
                 peer_addr,
                 packet_scheduler: self.config.packet_scheduler.clone(),
+                scheduler_update_rx,
             },
+            scheduler_update_tx,
         );
 
         conn.audit_log_stats.set_transport_handshake_start(
