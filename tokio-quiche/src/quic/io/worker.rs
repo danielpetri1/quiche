@@ -406,7 +406,7 @@ where
 
             // Flush to network after generating a single packet when GSO
             // is disabled.
-            if !self.cfg.with_gso {
+            if !self.cfg.with_gso || qconn.is_multipath_enabled() {
                 break outcome;
             }
 
