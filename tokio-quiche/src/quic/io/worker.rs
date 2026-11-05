@@ -218,7 +218,7 @@ where
                         "Applying runtime packet scheduler update";
                         "scheduler" => sched.name()
                     );
-                    self.packet_scheduler = Some(sched);
+                    self.packet_scheduler = Some(sched.new_instance());
                 }
             }
 

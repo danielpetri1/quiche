@@ -57,10 +57,11 @@ pub struct ConnectionParams<'a> {
     pub tls_cert: Option<TlsCertificatePaths<'a>>,
     /// Hooks to use for the connection.
     pub hooks: Hooks,
-    /// Packet scheduling algorithm to use.
+    /// Packet scheduler template. Each connection creates an independent
+    /// instance using [`PacketScheduler::new_instance`].
     ///
     /// For available values, see
-    /// [`PacketSchedulingAlgorithm`](crate::quic::io::scheduler::PacketSchedulingAlgorithm).
+    /// [`PacketSchedulingAlgorithm`](crate::quic::scheduler::PacketSchedulingAlgorithm).
     ///
     /// Defaults to `None`.
     pub packet_scheduler: Option<BoxedScheduler>,

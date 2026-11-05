@@ -138,6 +138,9 @@ impl SchedulerDecision {
 /// Trait defining a packet scheduler that can determine which path to use for
 /// sending packets
 pub trait PacketScheduler: Debug + Send + Sync + 'static {
+    /// Creates a scheduler for a connection.
+    fn new_instance(&self) -> BoxedScheduler;
+
     /// Get the next path to send a packet on
     fn next_path(&self, conn: &QuicheConnection) -> Option<SchedulerDecision>;
 
@@ -197,6 +200,10 @@ impl Default for MinRTTScheduler {
 }
 
 impl PacketScheduler for MinRTTScheduler {
+    fn new_instance(&self) -> BoxedScheduler {
+        Arc::new(Self::new())
+    }
+
     fn next_path(&self, conn: &QuicheConnection) -> Option<SchedulerDecision> {
         if let Some((path_id, _)) = conn.get_next_send_path_id(None, None, None) {
             let path = conn.path_stats().find(|p| p.path_id == path_id);
@@ -252,6 +259,10 @@ impl Default for LowRTTScheduler {
 }
 
 impl PacketScheduler for LowRTTScheduler {
+    fn new_instance(&self) -> BoxedScheduler {
+        Arc::new(Self::new())
+    }
+
     fn next_path(&self, conn: &QuicheConnection) -> Option<SchedulerDecision> {
         if let Some((path_id, _)) = conn.get_next_send_path_id(None, None, None) {
             let path = conn.path_stats().find(|p| p.path_id == path_id);
@@ -312,6 +323,10 @@ impl Default for RoundRobinScheduler {
 }
 
 impl PacketScheduler for RoundRobinScheduler {
+    fn new_instance(&self) -> BoxedScheduler {
+        Arc::new(Self::new())
+    }
+
     fn next_path(&self, conn: &QuicheConnection) -> Option<SchedulerDecision> {
         if let Some((path_id, _)) = conn.get_next_send_path_id(None, None, None) {
             let path = conn.path_stats().find(|p| p.path_id == path_id);
@@ -373,6 +388,10 @@ impl Default for RandomScheduler {
 }
 
 impl PacketScheduler for RandomScheduler {
+    fn new_instance(&self) -> BoxedScheduler {
+        Arc::new(Self::new())
+    }
+
     fn next_path(&self, conn: &QuicheConnection) -> Option<SchedulerDecision> {
         if let Some((path_id, _)) = conn.get_next_send_path_id(None, None, None) {
             let path = conn.path_stats().find(|p| p.path_id == path_id);
@@ -423,6 +442,10 @@ impl Default for LowestLatencyScheduler {
 }
 
 impl PacketScheduler for LowestLatencyScheduler {
+    fn new_instance(&self) -> BoxedScheduler {
+        Arc::new(Self::new())
+    }
+
     fn next_path(&self, conn: &QuicheConnection) -> Option<SchedulerDecision> {
         let mut paths = self.algorithm().active_paths(conn);
 
@@ -484,6 +507,13 @@ impl Default for EarliestCompletionFirstScheduler {
 /// In Proceedings of CoNEXT ’17. ACM, New York, NY, USA, 13 pages.
 /// https: //doi.org/10.1145/3143361.3143376
 impl PacketScheduler for EarliestCompletionFirstScheduler {
+    fn new_instance(&self) -> BoxedScheduler {
+        Arc::new(Self {
+            waiting: 0.0.into(),
+            beta: self.beta.load(Relaxed).into(),
+        })
+    }
+
     fn next_path(&self, conn: &QuicheConnection) -> Option<SchedulerDecision> {
         if let Some((path_id, _)) = conn.get_next_send_path_id(None, None, None) {
             let path = conn.path_stats().find(|p| p.path_id == path_id);
@@ -600,6 +630,13 @@ impl Default for StreamAwareEarliestCompletionFirst {
 /// In EPIQ ’18: Workshop on the Evolution, Performance, and Interoperability of QUIC, December 4, 2018, Heraklion, Greece.
 /// ACM, New York,  NY, USA, 7 pages. https://doi.org/10.1145/3284850.3284855
 impl PacketScheduler for StreamAwareEarliestCompletionFirst {
+    fn new_instance(&self) -> BoxedScheduler {
+        Arc::new(Self {
+            beta: self.beta.load(Relaxed).into(),
+            l: self.l.load(Relaxed).into(),
+        })
+    }
+
     fn next_path(&self, conn: &QuicheConnection) -> Option<SchedulerDecision> {
         if let Some((path_id, _)) = conn.get_next_send_path_id(None, None, None) {
             let path = conn.path_stats().find(|p| p.path_id == path_id);
