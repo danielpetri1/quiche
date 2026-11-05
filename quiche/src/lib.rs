@@ -3395,7 +3395,6 @@ impl Connection {
                 self.paths.get(recv_pid)?.network_path_id();
 
             if self.is_server &&
-                !self.paths.multipath() &&
                 recv_npid != previous_network_path_id &&
                 pkt_num_space.largest_rx_non_probing_pkt_num == pn
             {
