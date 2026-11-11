@@ -186,7 +186,14 @@ where
     M: Metrics,
 {
     #[inline]
-    pub(crate) fn new(params: QuicConnectionParams<Tx, M>, scheduler_update_tx: Option<mpsc::UnboundedSender<BoxedScheduler>>,) -> Self {
+    pub(crate) fn new(
+        mut params: QuicConnectionParams<Tx, M>,
+        scheduler_update_tx: Option<mpsc::UnboundedSender<BoxedScheduler>>,
+    ) -> Self {
+        params.packet_scheduler = params
+            .packet_scheduler
+            .as_ref()
+            .map(|scheduler| scheduler.new_instance());
         let (incoming_ev_sender, incoming_ev_receiver) =
             mpsc::channel(INCOMING_QUEUE_SIZE);
         let audit_log_stats = Arc::new(QuicAuditStats::new(params.scid.to_vec()));
